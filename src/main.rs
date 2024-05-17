@@ -78,6 +78,7 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     // Also note that the output vector is SORTED (in case S3 has inconsistent list_objects_v2 ordering)
     let mut files: Vec<PathBuf> = Vec::new();
     for path in paths {
+
         if is_s3(path) {
             let s3_result = expand_s3_dir(path).await?;
             for file in s3_result {
@@ -143,17 +144,22 @@ fn hash_str(text: &str, seed: usize) -> u64 {
 }
 
 
+fn reverse_map(map: &DashMap<u64, usize>) -> HashMap<usize, Vec<u64>> {
+    let grouped: HashMap<usize, Vec<u64>> = map
+        .iter().par_bridge()
+        .fold(|| HashMap::new(), |mut acc: HashMap<usize, Vec<u64>>, ref_multi| {
+            acc.entry(*ref_multi.value()).or_default().push(*ref_multi.key());
+            acc
+        })
+        .reduce(|| HashMap::new(), |mut acc, map| {
+            for (key, value) in map {
+                acc.entry(key).or_default().extend(value);
+            }
+            acc
+        });
 
-fn reverse_map(map: &DashMap<u64, usize>) -> DashMap<usize, Vec<u64>> {
-    let grouped = map.iter().group_by(|entry| *entry.value());
-    let output: DashMap<usize, Vec<u64>> = grouped
-        .into_iter()
-        .map(|(key, group)| (key, group.map(|entry| *entry.key()).collect()))
-        .collect();
-    output
+    grouped
 }
-
-
 
 /*=========================================================
 =                Process file fxn + helpers               =
@@ -249,12 +255,11 @@ async fn prune_from_hashset(input: &PathBuf, output: &PathBuf, keep_hashes: &Arc
 }
 
 
-fn get_dup_profile(rev_map: &DashMap<usize, Vec<u64>>) -> HashMap<usize, f64> {
+fn get_dup_profile(rev_map: &HashMap<usize, Vec<u64>>) -> HashMap<usize, f64> {
 
     let profile: HashMap<usize, usize>= rev_map
-        .iter()
-        .par_bridge()
-        .map(|item| (*item.key(), *item.key() as usize * item.value().len() as usize))
+        .par_iter()
+        .map(|(k,v)| (*k, *k as usize * v.len() as usize))
         .collect();
 
     let total_items = profile.par_iter().map(|(_,v)| v).sum::<usize>() as f64;
@@ -299,6 +304,8 @@ async fn main()-> Result<()> {
         args.threads
     };
     let input_files = expand_dirs(&args.input).await?;
+
+    println!("INPUTS {:?}", input_files);
     let pbar = ProgressBar::new(input_files.len() as u64)
         .with_style(
             ProgressStyle::with_template(
@@ -339,30 +346,22 @@ async fn main()-> Result<()> {
     }
     threadpool.join();
 
-
-
     // Step 3: Create set of hashes to keep
-    println!("Creating to-keep-set");
-    let rev_map = reverse_map(&dup_map);
-
+    let mut rev_map = reverse_map(&dup_map);
     let input_profile = get_dup_profile(&rev_map);
-    let output_rev_map : DashMap<usize, Vec<u64>> = DashMap::new();
-    let mut rng = thread_rng();
-    for ref_multi in rev_map.iter() {
-        let (k,v) = ref_multi.pair();
-        let target_size = (v.len() as f64 * args.subsample_rate).round() as usize;
-        let samples: Vec<_> = v.choose_multiple(&mut rng, target_size).collect();
-        output_rev_map.entry(*k).or_default();
-        output_rev_map.alter(&k, |_, mut els| {
-            els.extend(samples);
-            els
-        });
-    }
-    let output_profile = get_dup_profile(&output_rev_map);
-    let mut keep_hashes: HashSet<u64> = HashSet::new();
-    for vec in output_rev_map.iter().map(|ref_multi| ref_multi.value().clone()) {
-        keep_hashes.extend(vec.iter());
-    }
+    rev_map.par_iter_mut().for_each(|(_, values)| {
+        let mut rng = rand::thread_rng();
+        let target_size = (values.len() as f64 * args.subsample_rate).round() as usize;
+        values.shuffle(&mut rng);
+        values.truncate(target_size);
+    });
+    let output_profile = get_dup_profile(&rev_map);
+    let keep_hashes: HashSet<u64> = rev_map.par_iter()
+        .flat_map(|(_, values)| values.par_iter().cloned())
+        .collect();
+
+    println!("TOTAL HASHES {:?} | KEPT HAHSES {:?}",
+             dup_map.len(), keep_hashes.len());
     let keep_hashes = Arc::new(keep_hashes);
 
 
