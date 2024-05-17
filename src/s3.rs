@@ -106,7 +106,7 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Er
             Ok(output) => {
                 for object in output.contents() {
                     let key = object.key().unwrap_or_default();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd")) {
+                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd") || key.ends_with(".tar")) {
                         continue;
                     }
                     let mut s3_file = PathBuf::from("s3://");

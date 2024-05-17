@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use std::fs::File;
@@ -25,7 +26,7 @@ use std::hash::{Hash, Hasher, DefaultHasher};
 use dashmap::DashMap;
 use rand::thread_rng;
 use rand::seq::SliceRandom;
-
+use rayon::prelude::*;
 
 pub mod s3;
 
@@ -59,9 +60,10 @@ struct Args {
     #[arg(long, default_value_t=3)]
     s3_retries: usize,
 
-    /// Should we save frequency hash->count maps
+    /// Should we save duplicate profiles? 
+    /// (if so, save them in the output directory as input_profile.json, output_profile.json)
     #[arg(long, default_value_t=false)]
-    save_freqs: bool
+    save_profiles: bool
 }
 
 
@@ -142,11 +144,17 @@ fn hash_str(text: &str, seed: usize) -> u64 {
 
 fn reverse_dashmap(counter:  &DashMap<u64, usize>) -> Result<DashMap<usize, Vec<u64>>, Error> {
     let reverse_map: DashMap<usize, Vec<u64>> = DashMap::new();
-    counter.iter().for_each(|ref_multi| {
-        let (k,v) = ref_multi.pair();
-        reverse_map.entry(*v).or_default().push(*k);
-    });
-
+    let _ = counter.iter()
+        .par_bridge()
+        .map(|ref_multi| {
+            let (k,v) = ref_multi.pair();
+            reverse_map.entry(*v).or_default();
+            reverse_map.alter(&v, |_, mut els| {
+                els.push(*k);
+                els
+            });
+        });
+        
     Ok(reverse_map)
 }
 
@@ -155,7 +163,7 @@ fn reverse_dashmap(counter:  &DashMap<u64, usize>) -> Result<DashMap<usize, Vec<
 =========================================================*/
 
 async fn count_doc_freqs(input: &PathBuf, counter: &Arc<DashMap<u64, usize>>,
-                         hash_seed: usize, s3_retries: usize) -> Result<(), Error> {
+                         hash_seed: usize, s3_retries: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
     // Loops through all document 'text's in a jsonl, hashes the document and 
     // increments the hash counter in the dup map
 
@@ -175,12 +183,14 @@ async fn count_doc_freqs(input: &PathBuf, counter: &Arc<DashMap<u64, usize>>,
         counter.entry(hash_val).or_insert(0);
         counter.alter(&hash_val, |_, count| count +1);
     }
+    pbar.lock().unwrap().inc(1);
     Ok(())
 }
 
 
 async fn prune_from_hashset(input: &PathBuf, output: &PathBuf, keep_hashes: &Arc<HashSet<u64>>,
-                      hash_seed: usize, s3_retries: usize, total_docs: Arc<AtomicUsize>, removed_docs: Arc<AtomicUsize>) -> Result<(), Error> {
+                      hash_seed: usize, s3_retries: usize, total_docs: Arc<AtomicUsize>, removed_docs: Arc<AtomicUsize>,
+                      pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
 
     // Step a: Load file into memory/lines
     let reader = if is_s3(input) {
@@ -237,10 +247,41 @@ async fn prune_from_hashset(input: &PathBuf, output: &PathBuf, keep_hashes: &Arc
         let mut file = File::create(output).expect(format!("Unable to create output file {:?}", output).as_str());
         file.write_all(&output_bytes).expect(format!("Unable to write to {:?}", output).as_str());
     }
-
+    pbar.lock().unwrap().inc(1);
     Ok(())
 }
 
+
+fn get_dup_profile(rev_map: &DashMap<usize, Vec<u64>>) -> HashMap<usize, f64> {
+
+    let profile: HashMap<usize, usize>= rev_map
+        .iter()
+        .par_bridge()
+        .map(|item| (*item.key(), *item.key() as usize * item.value().len() as usize))
+        .collect();
+
+    let total_items = profile.par_iter().map(|(_,v)| v).sum::<usize>() as f64;
+
+    let output: HashMap<usize, f64> = profile.par_iter().map(|(k, v)| (*k, *v as f64 / total_items)).collect();
+    output
+    
+}
+
+
+fn save_profile(profile: HashMap<usize, f64>, dst: PathBuf) -> Result<(), Error> {
+    let profile_bytes = serde_json::to_vec(&profile).unwrap();
+
+    if is_s3(dst.clone()) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let cursor = Cursor::new(profile_bytes);
+        runtime.block_on(write_cursor_to_s3(&dst, cursor)).unwrap();
+    } else {
+        let mut file = File::create(dst).unwrap();
+        file.write_all(&profile_bytes.as_slice()).unwrap();
+    }
+
+    Ok(())
+}
 
 
 
@@ -284,15 +325,13 @@ async fn main()-> Result<()> {
                 .build()
                 .unwrap();   
             let result = rt.block_on({
-                let result = count_doc_freqs(
+                count_doc_freqs(
                     &input,
                     &dup_map,
                     args.hash_seed,
                     args.s3_retries,
-                    );
-                pbar.lock().unwrap().inc(1);
-                result
-
+                    pbar
+                    )
                 });            
             match result {            
                 Err(err) => {
@@ -304,16 +343,29 @@ async fn main()-> Result<()> {
     }
     threadpool.join();
 
+
+
     // Step 3: Create set of hashes to keep
     println!("Creating to-keep-set");
-    let mut keep_hashes: HashSet<u64> = HashSet::new();
     let rev_map = reverse_dashmap(&dup_map).unwrap();
+
+    let input_profile = get_dup_profile(&rev_map);
+    let output_rev_map : DashMap<usize, Vec<u64>> = DashMap::new();
     let mut rng = thread_rng();
     for ref_multi in rev_map.iter() {
-        let (_k,v) = ref_multi.pair();
+        let (k,v) = ref_multi.pair();
         let target_size = (v.len() as f64 * args.subsample_rate).round() as usize;
         let samples: Vec<_> = v.choose_multiple(&mut rng, target_size).collect();
-        keep_hashes.extend(samples);
+        output_rev_map.entry(*k).or_default();
+        output_rev_map.alter(&k, |_, mut els| {
+            els.extend(samples);
+            els
+        });
+    }
+    let output_profile = get_dup_profile(&output_rev_map);
+    let mut keep_hashes: HashSet<u64> = HashSet::new();
+    for vec in output_rev_map.iter().map(|ref_multi| ref_multi.value().clone()) {
+        keep_hashes.extend(vec.iter());
     }
     let keep_hashes = Arc::new(keep_hashes);
 
@@ -346,18 +398,16 @@ async fn main()-> Result<()> {
                 .build()
                 .unwrap();   
             let result = rt.block_on({
-                let result = prune_from_hashset(
+                prune_from_hashset(
                     &input,
                     &output,
                     &keep_hashes,
                     args.hash_seed,
                     args.s3_retries,
                     total_docs, 
-                    removed_docs
-                    );
-                pbar.lock().unwrap().inc(1);
-                result
-
+                    removed_docs,
+                    pbar
+                    )
                 });            
             match result {            
                 Err(err) => {
@@ -369,6 +419,10 @@ async fn main()-> Result<()> {
     }
     threadpool.join();    
 
+    if args.save_profiles {
+        save_profile(input_profile, args.output.join("input_profile.json")).unwrap();
+        save_profile(output_profile, args.output.join("output_profile.json")).unwrap();
+    }
 
     println!("Finishing exact dedup run!");
     println!("-------------------------------");
