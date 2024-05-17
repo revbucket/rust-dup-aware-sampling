@@ -27,6 +27,7 @@ use dashmap::DashMap;
 use rand::thread_rng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
+use itertools::Itertools;
 
 pub mod s3;
 
@@ -142,21 +143,17 @@ fn hash_str(text: &str, seed: usize) -> u64 {
 }
 
 
-fn reverse_dashmap(counter:  &DashMap<u64, usize>) -> Result<DashMap<usize, Vec<u64>>, Error> {
-    let reverse_map: DashMap<usize, Vec<u64>> = DashMap::new();
-    let _ = counter.iter()
-        .par_bridge()
-        .map(|ref_multi| {
-            let (k,v) = ref_multi.pair();
-            reverse_map.entry(*v).or_default();
-            reverse_map.alter(&v, |_, mut els| {
-                els.push(*k);
-                els
-            });
-        });
-        
-    Ok(reverse_map)
+
+fn reverse_map(map: &DashMap<u64, usize>) -> DashMap<usize, Vec<u64>> {
+    let grouped = map.iter().group_by(|entry| *entry.value());
+    let output: DashMap<usize, Vec<u64>> = grouped
+        .into_iter()
+        .map(|(key, group)| (key, group.map(|entry| *entry.key()).collect()))
+        .collect();
+    output
 }
+
+
 
 /*=========================================================
 =                Process file fxn + helpers               =
@@ -346,7 +343,7 @@ async fn main()-> Result<()> {
 
     // Step 3: Create set of hashes to keep
     println!("Creating to-keep-set");
-    let rev_map = reverse_dashmap(&dup_map).unwrap();
+    let rev_map = reverse_map(&dup_map);
 
     let input_profile = get_dup_profile(&rev_map);
     let output_rev_map : DashMap<usize, Vec<u64>> = DashMap::new();
@@ -367,7 +364,6 @@ async fn main()-> Result<()> {
         keep_hashes.extend(vec.iter());
     }
     let keep_hashes = Arc::new(keep_hashes);
-
 
 
     // Step 4: Prune and only keep docs that hash to the kept values
