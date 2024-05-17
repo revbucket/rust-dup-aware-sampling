@@ -268,13 +268,12 @@ fn get_dup_profile(rev_map: &DashMap<usize, Vec<u64>>) -> HashMap<usize, f64> {
 }
 
 
-fn save_profile(profile: HashMap<usize, f64>, dst: PathBuf) -> Result<(), Error> {
+async fn save_profile(profile: HashMap<usize, f64>, dst: PathBuf) -> Result<(), Error> {
     let profile_bytes = serde_json::to_vec(&profile).unwrap();
 
     if is_s3(dst.clone()) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let cursor = Cursor::new(profile_bytes);
-        runtime.block_on(write_cursor_to_s3(&dst, cursor)).unwrap();
+        write_cursor_to_s3(&dst, cursor).await.unwrap();
     } else {
         let mut file = File::create(dst).unwrap();
         file.write_all(&profile_bytes.as_slice()).unwrap();
@@ -420,8 +419,8 @@ async fn main()-> Result<()> {
     threadpool.join();    
 
     if args.save_profiles {
-        save_profile(input_profile, args.output.join("input_profile.json")).unwrap();
-        save_profile(output_profile, args.output.join("output_profile.json")).unwrap();
+        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
+        save_profile(output_profile, args.output.join("output_profile.json")).await.unwrap();
     }
 
     println!("Finishing exact dedup run!");
