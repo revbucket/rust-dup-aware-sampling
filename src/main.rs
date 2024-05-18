@@ -354,6 +354,13 @@ async fn main()-> Result<()> {
     // Step 3: Create set of hashes to keep
     let mut rev_map = reverse_map(&dup_map);
     let input_profile = get_dup_profile(&rev_map);
+    if args.save_profiles {
+        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
+        if args.profile_only {
+            return Ok(());
+        }
+    }
+
     rev_map.par_iter_mut().for_each(|(_, values)| {
         let mut rng = rand::thread_rng();
         let target_size = (values.len() as f64 * args.subsample_rate).round() as usize;
@@ -366,12 +373,9 @@ async fn main()-> Result<()> {
         .collect();
 
     if args.save_profiles {
-        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
         save_profile(output_profile, args.output.join("output_profile.json")).await.unwrap();
     }
-    if args.profile_only {
-        return Ok(());
-    }
+
 
     println!("TOTAL HASHES {:?} | KEPT HAHSES {:?}",
              dup_map.len(), keep_hashes.len());
