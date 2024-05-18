@@ -64,7 +64,12 @@ struct Args {
     /// Should we save duplicate profiles? 
     /// (if so, save them in the output directory as input_profile.json, output_profile.json)
     #[arg(long, default_value_t=false)]
-    save_profiles: bool
+    save_profiles: bool,
+
+
+    /// If this is true, save profiles only! (and don't make a new dataset) 
+    #[arg(long, default_value_t=false)]
+    profile_only: bool,
 }
 
 
@@ -360,6 +365,14 @@ async fn main()-> Result<()> {
         .flat_map(|(_, values)| values.par_iter().cloned())
         .collect();
 
+    if args.save_profiles {
+        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
+        save_profile(output_profile, args.output.join("output_profile.json")).await.unwrap();
+    }
+    if args.profile_only {
+        return Ok(());
+    }
+
     println!("TOTAL HASHES {:?} | KEPT HAHSES {:?}",
              dup_map.len(), keep_hashes.len());
     let keep_hashes = Arc::new(keep_hashes);
@@ -413,10 +426,7 @@ async fn main()-> Result<()> {
     }
     threadpool.join();    
 
-    if args.save_profiles {
-        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
-        save_profile(output_profile, args.output.join("output_profile.json")).await.unwrap();
-    }
+
 
     println!("Finishing exact dedup run!");
     println!("-------------------------------");
