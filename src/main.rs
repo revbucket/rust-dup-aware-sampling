@@ -25,6 +25,8 @@ use glob::glob;
 use std::hash::{Hash, Hasher, DefaultHasher};
 use dashmap::DashMap;
 use rand::thread_rng;
+use rand::Rng;
+
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use itertools::Itertools;
@@ -165,6 +167,14 @@ fn reverse_map(map: &DashMap<u64, usize>) -> HashMap<usize, Vec<u64>> {
 
     grouped
 }
+
+fn get_subsample_size(n: usize, p: f64) -> usize {
+    // Flips n coins with p(heads) and returns number of heads
+    // (i.e., sample from binomial distribution)
+    (0..n).into_par_iter().map(|_| rand::thread_rng().gen_bool(p) as usize).sum()
+}
+
+
 
 /*=========================================================
 =                Process file fxn + helpers               =
@@ -360,10 +370,9 @@ async fn main()-> Result<()> {
             return Ok(());
         }
     }
-
     rev_map.par_iter_mut().for_each(|(_, values)| {
         let mut rng = rand::thread_rng();
-        let target_size = (values.len() as f64 * args.subsample_rate).round() as usize;
+        let target_size = get_subsample_size(values.len(), args.subsample_rate);
         values.shuffle(&mut rng);
         values.truncate(target_size);
     });
