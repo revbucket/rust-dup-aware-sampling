@@ -250,7 +250,7 @@ async fn prune_from_hashset(input: &PathBuf, output: &PathBuf, keep_hashes: &Arc
             encoder.write_all(&output_bytes).unwrap();            
             encoder.finish().unwrap()
         },
-        Some("zstd") => {
+        Some("zstd") | Some("zst") => {
             let mut encoder = ZstdEncoder::new(Vec::new(), 0).unwrap();
             encoder.write_all(&output_bytes).unwrap();
             encoder.finish().unwrap()
