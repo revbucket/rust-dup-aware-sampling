@@ -40,7 +40,7 @@ pub mod s3;
 #[derive(Parser, Debug)]
 struct Args {
     /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
-    #[arg(required=true, long)]
+    #[arg(required=true, long, num_args=1..)]
     input: Vec<PathBuf>,
 
     /// Output location (may be an s3 uri)
@@ -320,7 +320,7 @@ async fn main()-> Result<()> {
     };
     let input_files = expand_dirs(&args.input).await?;
 
-    println!("INPUTS {:?}", input_files);
+    // println!("INPUTS {:?}", input_files);
     let pbar = ProgressBar::new(input_files.len() as u64)
         .with_style(
             ProgressStyle::with_template(
