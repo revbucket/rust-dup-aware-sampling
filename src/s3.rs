@@ -1,4 +1,7 @@
 // General tools for interfacing with s3
+use std::io::Read;
+use tokio::io::AsyncRead;
+use anyhow::Error;
 use std::path::{PathBuf, Path};
 use anyhow::{Result};
 
@@ -14,6 +17,8 @@ use rand::{Rng};
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
+use flate2::read::MultiGzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 
 /*==========================================================
@@ -88,12 +93,13 @@ pub(crate) async fn get_s3_client() -> Result<Client, S3Error> {
 }
 
 
-pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Error> {
+pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf, valid_exts: &[&str]) -> Result<Vec<PathBuf>, S3Error> {
     // Collects all .json.gz/.jsonl.gz files prefixed by the provided s3_uri 
     let mut s3_files: Vec<PathBuf> = Vec::new();
     let client = get_s3_client().await?;
     let (bucket, prefix) = split_s3_path(s3_uri);
 
+    //let ext = ext.unwrap_or(".jsonl.gz");
     let mut response = client
         .list_objects_v2()    
         .bucket(bucket.to_owned())
@@ -105,15 +111,13 @@ pub(crate) async fn expand_s3_dir(s3_uri: &PathBuf) -> Result<Vec<PathBuf>, S3Er
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    let key = object.key().unwrap_or_default();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd") || key.ends_with(".tar") 
-                         || key.ends_with(".jsonl") || key.ends_with(".jsonl.zst") ) {
-                        continue;
+                    let key = object.key().unwrap_or_default();     
+                    if valid_exts.iter().any(|ext| key.ends_with(ext)) {
+                        let mut s3_file = PathBuf::from("s3://");
+                        s3_file.push(bucket.clone());
+                        s3_file.push(key);
+                        s3_files.push(s3_file);
                     }
-                    let mut s3_file = PathBuf::from("s3://");
-                    s3_file.push(bucket.clone());
-                    s3_file.push(key);
-                    s3_files.push(s3_file);
                 }
             }
             Err(err) => {
@@ -136,28 +140,33 @@ async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> R
 
 
 
-pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>, S3Error>{
+pub(crate) async fn get_reader_from_s3<P: AsRef<Path>>(path: P, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>, Error>{
     // Gets all the data from an S3 file and loads it into memory and returns a Bufreader over it
     let (s3_bucket, s3_key) = split_s3_path(&path);
     let object_body = get_object_with_retry(&s3_bucket, &s3_key, num_retries.unwrap_or(5)).await?;
-    let body_stream = object_body.into_async_read();
-    let mut data = Vec::new();
 
-    if (path.as_ref().extension().unwrap() == "zstd") || (path.as_ref().extension().unwrap() == "zst") {
-        let zstd = asyncZstd::new(body_stream);
-        let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
-        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    let data = object_body.collect().await?;
+    let data = data.into_bytes();
 
-    } else {
-        let gz = asyncGZ::new(body_stream);
-        let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
-        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");        
+    let mut decompressed = Vec::new();
+    match path.as_ref().extension().and_then(|ext| ext.to_str()) {
+        Some("gz") => {
+            let mut decoder = MultiGzDecoder::new(data.as_ref());
+            decoder.read_to_end(&mut decompressed).unwrap();
+        }
+        Some("zstd") | Some("zst") => {
+            let mut decoder = ZstdDecoder::new(data.as_ref()).unwrap();
+            decoder.read_to_end(&mut decompressed).unwrap();
+        }
+        _ => {decompressed = data.to_vec()}
     };
 
-    let cursor = Cursor::new(data);
+
+    let cursor = Cursor::new(decompressed);
 
     Ok(BufReader::new(cursor))
 }
+
 
 
 
@@ -175,6 +184,5 @@ pub(crate) async fn write_cursor_to_s3(s3_uri: &PathBuf, cursor: Cursor<Vec<u8>>
 
     Ok(response)
 }
-
 
 

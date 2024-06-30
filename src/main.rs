@@ -6,16 +6,16 @@ use std::path::PathBuf;
 use std::io::{BufReader, BufRead, Cursor, Write, Read};
 use std::time::Instant;
 use anyhow::{anyhow, Result, Error};
-use clap::{Parser};
+use clap::{Parser, Subcommand};
 use serde_json;
 use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use flate2::read::MultiGzDecoder;   
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::s3::{is_s3, expand_s3_dir, get_reader_from_s3, write_cursor_to_s3};
 use indicatif::{ProgressBar,ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,115 +31,84 @@ use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use itertools::Itertools;
 
+use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf, has_json_extension};
+
 pub mod s3;
+pub mod io; 
+
+
+/*
+Multiple commands:
+1. build-config : builds a way to map path -> path_id (assumes pool remain constant)
+2. exact-profile : collects the exact-duplicate profile and saves it somewher
+3. more TBD
+*/
+
+
 
 /*============================================
 =            Args                            =
 ============================================*/
 
-#[derive(Parser, Debug)]
-struct Args {
-    /// (List of) directories/files (on s3 or local) that are jsonl.gz or jsonl.zstd files
-    #[arg(required=true, long, num_args=1..)]
-    input: Vec<PathBuf>,
+#[derive(Parser)]
+#[clap(author, version, about, long_about = None)]
+struct ArgParser {
+    #[clap(subcommand)]
+    command: Commands,
 
-    /// Output location (may be an s3 uri)
-    #[arg(required=true, long)]
-    output: PathBuf,
-
-    /// How many copies are allowed of a single document
-    #[arg(required=true, long)]
-    subsample_rate: f64,
-
-    /// How many threads to use (default is max available)
     #[arg(long, default_value_t=0)]
     threads: usize,
-
-    /// Seed to initialize hasher 
-    #[arg(long, default_value_t=1234)]
-    hash_seed: usize,
-
-    /// How many times to retry s3 operations
-    #[arg(long, default_value_t=3)]
-    s3_retries: usize,
-
-    /// Should we save duplicate profiles? 
-    /// (if so, save them in the output directory as input_profile.json, output_profile.json)
-    #[arg(long, default_value_t=false)]
-    save_profiles: bool,
-
-
-    /// If this is true, save profiles only! (and don't make a new dataset) 
-    #[arg(long, default_value_t=false)]
-    profile_only: bool,
 }
+
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    #[clap(arg_required_else_help = true)]
+
+    BuildConfig {
+        // Just makes and saves the path lookup object 
+
+        /// Input locations for paths to hash
+        #[arg(required=true, long, num_args=1..)]
+        input: Vec<PathBuf>,        
+
+        /// Output location (may be an s3 uri)
+        #[arg(required=true, long)]
+        output: PathBuf,
+    },
+
+
+    ExactProfile {
+        // Takes the config and builds an "exact duplicate" profile
+        #[arg(required=true, long)]
+        config: PathBuf,   
+
+        #[arg(required=true, long)]
+        output: PathBuf,
+    },
+
+
+
+}
+
+
 
 
 /*================================================
 =            Utilities/Helpers                   =
 ================================================*/
 
-async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {    
-    // Can handle both local and s3 files/directories
-    // Note that this function is async because we need to wait for all the s3 files to get expanded
-    // Also note that the output vector is SORTED (in case S3 has inconsistent list_objects_v2 ordering)
-    let mut files: Vec<PathBuf> = Vec::new();
-    for path in paths {
-
-        if is_s3(path) {
-            let s3_result = expand_s3_dir(path).await?;
-            for file in s3_result {
-                files.push(file.clone());
-            }
-        } else if path.is_dir() {
-            let path_str = path
-                .to_str()
-                .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
-            for entry in glob(&format!("{}/**/*.json*.gz", path_str))? {
-                files.push(entry?.to_path_buf());
-            }
-        } else {
-            files.push(path.clone());
-        }
-    }   
-    files.sort();
-    Ok(files)
+fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
+    let mut template = String::from(units);
+    template.push_str(" {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]");
+    let pbar = ProgressBar::new(num_items as u64)
+        .with_style(
+            ProgressStyle::with_template(&template).unwrap()
+        );
+    pbar.inc(0);
+    pbar
 }
 
-
-fn get_output_filename(inputs: &[PathBuf], input_filename: &PathBuf, output_directory: &PathBuf) -> PathBuf {
-    // More fancy output-file naming that no longer assumes unique inputs
-    let matching_prefix = inputs
-        .iter()
-        .find(|pfx| input_filename.starts_with(pfx))
-        .expect("No matching prefix found?!?");
-
-    let relative_path = input_filename.strip_prefix(matching_prefix).unwrap();
-    output_directory.clone().join(relative_path)
-
-}
-
-fn read_file_into_memory(input_file: &PathBuf) ->Result<Cursor<Vec<u8>>, Error>{
-    // Takes a local file (must be local!) and reads it into a Cursor of bytes
-    let mut file = File::open(input_file).expect("Failed to open file");
-
-    let mut contents = Vec::new();
-    let ext = input_file.extension().unwrap().to_string_lossy().to_lowercase();
-    if ext == "gz" {
-        // Gzip case        
-        let mut decoder = MultiGzDecoder::new(file);
-        decoder.read_to_end(&mut contents).expect("Failed to read loca gzip file");
-    } else if ext == "zstd" || ext == "zst" {
-        // Zstd case
-        let mut decoder = ZstdDecoder::new(file).unwrap();
-        decoder.read_to_end(&mut contents).expect("Failed to read local zstd file");
-    } else {
-        file.read_to_end(&mut contents).expect("Failed to read local file");
-
-        // No compression case 
-    }
-    Ok(Cursor::new(contents))
-}
 
 
 fn hash_str(text: &str, seed: usize) -> u64 {
@@ -168,134 +137,97 @@ fn reverse_map(map: &DashMap<u64, usize>) -> HashMap<usize, Vec<u64>> {
     grouped
 }
 
-fn get_subsample_size(n: usize, p: f64) -> usize {
-    // Flips n coins with p(heads) and returns number of heads
-    // (i.e., sample from binomial distribution)
-    (0..n).into_par_iter().map(|_| rand::thread_rng().gen_bool(p) as usize).sum()
+
+
+/*=================================================
+=                  Config builder                 =
+=================================================*/
+#[derive(Serialize, Deserialize)]
+pub struct DupConfig {
+    pub input: Vec<PathBuf>,
+    pub indices: HashMap<PathBuf, usize>
+}
+
+impl DupConfig {
+    pub fn new(input: &Vec<PathBuf>) -> Result<Self, Error> {
+        let mut paths = expand_dirs(input.clone(), None).unwrap();
+        paths.sort();
+        let indices: HashMap::<PathBuf, usize> = paths.iter()
+            .enumerate()
+            .map(|(i,p)| (p.clone(), i))
+            .collect();
+        Ok(DupConfig {input: input.clone(), indices})
+
+    }
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, Error> {
+        let json_string = serde_json::to_string(self).unwrap();
+        Ok(json_string.into_bytes())
+    }
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let json_string = String::from_utf8(bytes.to_vec()).unwrap();
+        let config: DupConfig = serde_json::from_str(&json_string).unwrap();
+        Ok(config)
+    }
+}
+
+fn build_config(input: &Vec<PathBuf>, output: &PathBuf) -> Result<DupConfig, Error> {
+
+    let config = DupConfig::new(input).unwrap();
+    let json_bytes = config.to_json_bytes().unwrap();
+
+    let output = if has_json_extension(&output) {
+        output.clone()
+    } else {
+        output.clone().join("config.json.gz")
+    };
+    write_mem_to_pathbuf(&json_bytes, &output).unwrap();
+
+    Ok(config)
 }
 
 
+/*=================================================
+=              Exact Duplicate Profile            =
+=================================================*/
 
-/*=========================================================
-=                Process file fxn + helpers               =
-=========================================================*/
+fn build_exact_profile(config: &PathBuf, output: &PathBuf) -> Result<(), Error> {
+    // Data structure here we want to save is just a vector of groups
+    // where each group is a vector of (path_id, line_num) tuples
 
-async fn count_doc_freqs(input: &PathBuf, counter: &Arc<DashMap<u64, usize>>,
-                         hash_seed: usize, s3_retries: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
-    // Loops through all document 'text's in a jsonl, hashes the document and 
-    // increments the hash counter in the dup map
+    let config_contents = read_pathbuf_to_mem(config).unwrap().into_inner().into_inner();
+    let config = DupConfig::from_json_bytes(&config_contents).unwrap();
+    let grouper : DashMap::<u64, Vec<(usize, usize)>> = DashMap::new();
+    let pbar = build_pbar(config.indices.len(), "Paths");
+    config.indices.par_iter()
+        .for_each(|(p, idx)| {
+            collect_exact_dups(p, *idx, &grouper).unwrap()
+        });
 
-    // Step a: Load file into memory/lines
-    let reader = if is_s3(input) {
-        get_reader_from_s3(input, Some(s3_retries)).await.unwrap()
-    } else {
-        BufReader::new(read_file_into_memory(&input).unwrap())
-    };
-
-    // Step b: Iterate over lines and count frequencies
-    for line in reader.lines() {
-        let line = line?;
-        let json: Value = serde_json::from_str(&line)?;
-        let text = json["text"].as_str().unwrap();
-        let hash_val = hash_str(&text, hash_seed);
-        counter.entry(hash_val).or_insert(0);
-        counter.alter(&hash_val, |_, count| count +1);
-    }
-    pbar.lock().unwrap().inc(1);
-    Ok(())
-}
-
-
-async fn prune_from_hashset(input: &PathBuf, output: &PathBuf, keep_hashes: &Arc<HashSet<u64>>,
-                      hash_seed: usize, s3_retries: usize, total_docs: Arc<AtomicUsize>, removed_docs: Arc<AtomicUsize>,
-                      pbar: Arc<Mutex<ProgressBar>>) -> Result<(), Error> {
-
-    // Step a: Load file into memory/lines
-    let reader = if is_s3(input) {
-        get_reader_from_s3(input, Some(s3_retries)).await.unwrap()
-    } else {
-        BufReader::new(read_file_into_memory(&input).unwrap())
-    };
-
-
-    // Step b: Iterate over lines and check if seen so many duplicates
-    let mut cur_lines = 0;
-    let mut cur_removed = 0;
-    let mut output_lines : Vec<String> = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        let json: Value = serde_json::from_str(&line)?;
-        let text = json["text"].as_str().unwrap();  
-        let hash_val = hash_str(&text, hash_seed);
-        cur_lines += 1;
-        if keep_hashes.contains(&hash_val) {
-            output_lines.push(line);
-        } else {
-            cur_removed += 1;
-        }
-    }
-
-    let output_lines = output_lines.join("\n");
-    total_docs.fetch_add(cur_lines, Ordering::SeqCst);
-    removed_docs.fetch_add(cur_removed, Ordering::SeqCst);
-
-    // Step c: Take lines and write to output file, modify loggers
-    if output_lines.len() == 0 {
-        return Ok(());
-    }
-    let output_bytes = output_lines.as_bytes();
-    let output_bytes = match output.extension().unwrap().to_str() {
-        Some("gz") => {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&output_bytes).unwrap();            
-            encoder.finish().unwrap()
-        },
-        Some("zstd") | Some("zst") => {
-            let mut encoder = ZstdEncoder::new(Vec::new(), 0).unwrap();
-            encoder.write_all(&output_bytes).unwrap();
-            encoder.finish().unwrap()
-        },
-        _ => {output_bytes.to_vec()}
-    };
-
-    if is_s3(output) {
-        let cursor = Cursor::new(output_bytes.to_vec());
-        write_cursor_to_s3(&output, cursor).await.expect(format!("Unable to write to output file {:?}", output).as_str());
-    } else {
-        let mut file = File::create(output).expect(format!("Unable to create output file {:?}", output).as_str());
-        file.write_all(&output_bytes).expect(format!("Unable to write to {:?}", output).as_str());
-    }
-    pbar.lock().unwrap().inc(1);
-    Ok(())
-}
-
-
-fn get_dup_profile(rev_map: &HashMap<usize, Vec<u64>>) -> HashMap<usize, f64> {
-
-    let profile: HashMap<usize, usize>= rev_map
-        .par_iter()
-        .map(|(k,v)| (*k, *k as usize * v.len() as usize))
+    let groups: Vec<Vec<(usize, usize)>> = grouper
+        .iter()
+        .par_bridge()
+        .map(|e| e.value().clone())
         .collect();
 
-    let total_items = profile.par_iter().map(|(_,v)| v).sum::<usize>() as f64;
+    let json_groups = serde_json::to_string(&groups).unwrap().into_bytes();
+    write_mem_to_pathbuf(&json_groups, output).unwrap();
 
-    let output: HashMap<usize, f64> = profile.par_iter().map(|(k, v)| (*k, *v as f64 / total_items)).collect();
-    output
-    
+    Ok(())
 }
 
 
-async fn save_profile(profile: HashMap<usize, f64>, dst: PathBuf) -> Result<(), Error> {
-    let profile_bytes = serde_json::to_vec(&profile).unwrap();
-
-    if is_s3(dst.clone()) {
-        let cursor = Cursor::new(profile_bytes);
-        write_cursor_to_s3(&dst, cursor).await.unwrap();
-    } else {
-        let mut file = File::create(dst).unwrap();
-        file.write_all(&profile_bytes.as_slice()).unwrap();
+fn collect_exact_dups(path: &PathBuf, path_idx: usize, grouper: &DashMap<u64, Vec<(usize, usize)>>) -> Result<(), Error> {
+    let contents = read_pathbuf_to_mem(path).unwrap();
+    let mut line_count: usize = 0;
+    for line in contents.lines() {
+        let doc_id = (path_idx, line_count);
+        let line = line.unwrap();
+        let json: Value = serde_json::from_str(&line).unwrap();
+        let text = json["text"].as_str().unwrap();
+        let text_hash = hash_str(text, 0);
+        grouper.entry(text_hash).or_default().push(doc_id);
+        line_count += 1;
     }
-
     Ok(())
 }
 
@@ -306,152 +238,25 @@ async fn save_profile(profile: HashMap<usize, f64>, dst: PathBuf) -> Result<(), 
 =================================================*/
 
 
-#[tokio::main]
-async fn main()-> Result<()> {
-
-    // Step 1: initialize things and collect files 
-    let start_time = Instant::now();
-
-    let args = Args::parse();
-    let threads = if args.threads == 0 {
-        available_parallelism().unwrap().get()
-    } else {
-        args.threads
-    };
-    let input_files = expand_dirs(&args.input).await?;
-
-    // println!("INPUTS {:?}", input_files);
-    let pbar = ProgressBar::new(input_files.len() as u64)
-        .with_style(
-            ProgressStyle::with_template(
-                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
-            ).unwrap()
-        );
-    let pbar = Arc::new(Mutex::new(pbar));
-    let dup_map = Arc::new(DashMap::new());
-
-
-    // Step 2: Iterate over all files and count frequencies
-    let threadpool = ThreadPool::new(threads);
-    for input in &input_files { 
-        let input = input.clone();   
-        let pbar = pbar.clone();
-        let dup_map = Arc::clone(&dup_map);
-        threadpool.execute(move || {        
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-            let result = rt.block_on({
-                count_doc_freqs(
-                    &input,
-                    &dup_map,
-                    args.hash_seed,
-                    args.s3_retries,
-                    pbar
-                    )
-                });            
-            match result {            
-                Err(err) => {
-                    eprintln!("Error processing {:?}; {:?}", input, err);
-                },
-                _ => {},
-            };
-        });
+fn main() {
+    let args = ArgParser::parse();
+    let threads = args.threads;
+    if threads != 0 {
+        std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
     }
-    threadpool.join();
 
-    // Step 3: Create set of hashes to keep
-    let mut rev_map = reverse_map(&dup_map);
-    let input_profile = get_dup_profile(&rev_map);
-    if args.save_profiles {
-        save_profile(input_profile, args.output.join("input_profile.json")).await.unwrap();
-        if args.profile_only {
-            return Ok(());
+    let result = match &args.command {
+        Commands::BuildConfig {input, output} => {
+            let result = build_config(input, output);
+            result.unwrap();
+            Ok(())
+        },
+        Commands::ExactProfile {config, output} => {
+            build_exact_profile(&config, output)
         }
-    }
-    rev_map.par_iter_mut().for_each(|(_, values)| {
-        let mut rng = rand::thread_rng();
-        let target_size = get_subsample_size(values.len(), args.subsample_rate);
-        values.shuffle(&mut rng);
-        values.truncate(target_size);
-    });
-    let output_profile = get_dup_profile(&rev_map);
-    let keep_hashes: HashSet<u64> = rev_map.par_iter()
-        .flat_map(|(_, values)| values.par_iter().cloned())
-        .collect();
-
-    if args.save_profiles {
-        save_profile(output_profile, args.output.join("output_profile.json")).await.unwrap();
-    }
+    };
 
 
-    println!("TOTAL HASHES {:?} | KEPT HAHSES {:?}",
-             dup_map.len(), keep_hashes.len());
-    let keep_hashes = Arc::new(keep_hashes);
-
-
-    // Step 4: Prune and only keep docs that hash to the kept values
-    println!("Actually pruning dataset!");
-    let pbar = ProgressBar::new(input_files.len() as u64)
-        .with_style(
-            ProgressStyle::with_template(
-                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
-            ).unwrap()
-        );
-    let pbar = Arc::new(Mutex::new(pbar));
-    // Step 2: Iterate over all files and count frequencies
-    let threadpool = ThreadPool::new(threads);
-    let total_docs = Arc::new(AtomicUsize::new(0));
-    let removed_docs = Arc::new(AtomicUsize::new(0));    
-    for input in &input_files {    
-        let input = input.clone();
-        let output = get_output_filename(&args.input, &input, &args.output);        
-        let pbar = pbar.clone();
-        let keep_hashes = keep_hashes.clone();        
-        let total_docs = total_docs.clone();
-        let removed_docs = removed_docs.clone();
-
-        threadpool.execute(move || {        
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();   
-            let result = rt.block_on({
-                prune_from_hashset(
-                    &input,
-                    &output,
-                    &keep_hashes,
-                    args.hash_seed,
-                    args.s3_retries,
-                    total_docs, 
-                    removed_docs,
-                    pbar
-                    )
-                });            
-            match result {            
-                Err(err) => {
-                    eprintln!("Error processing {:?}; {:?}", input, err);
-                },
-                _ => {},
-            };
-        });
-    }
-    threadpool.join();    
-
-
-
-    println!("Finishing exact dedup run!");
-    println!("-------------------------------");
-    println!("Ran in {:?} (s)", start_time.elapsed().as_secs());
-    println!("Saw {:?} documents | Removed {:?} of them", 
-             total_docs.fetch_add(0, Ordering::SeqCst),
-             removed_docs.fetch_add(0, Ordering::SeqCst));
-
-
-
-
-    Ok(())
 }
 
 
