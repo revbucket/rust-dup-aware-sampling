@@ -92,7 +92,7 @@ enum Commands {
         #[arg(required=true, long)]
         group_ids: PathBuf,
 
-        #[arg(required=true, long)]
+        #[arg(required=true, long, num_args=1..)]
         sample_freq: Vec<usize>,
 
         #[arg(required=true, long)] 
@@ -352,7 +352,7 @@ fn build_good_toulmin_profile(group_ids: &PathBuf, sample_freq: &Vec<usize>, out
     let start_read = Instant::now();
     let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
     let mut group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
-    
+
     println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
 
     println!("Starting shuffle...");
