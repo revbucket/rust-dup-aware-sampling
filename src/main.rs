@@ -312,7 +312,7 @@ fn true_dup_series(group_ids: &PathBuf, polling_freq: usize, output: &PathBuf) -
 fn parallel_shuffle<T: Send>(v: Vec<T>) -> Vec<T> {
     let len = v.len();
     let v = Mutex::new(v);
-    let pbar = build_pbar(len, "Items")
+    let pbar = build_pbar(len, "Items");
     (0..len).into_par_iter().for_each(|i| {
         let mut rng = thread_rng();
         let j = rng.gen_range(i..len);
