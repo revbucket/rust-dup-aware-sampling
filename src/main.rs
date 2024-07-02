@@ -1,37 +1,24 @@
+use dashmap::DashSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
-
-use std::fs::File;
 use std::path::PathBuf;
-use std::io::{BufReader, BufRead, Cursor, Write, Read};
+use std::io::{BufRead};
 use std::time::Instant;
-use anyhow::{anyhow, Result, Error};
+use anyhow::{Result, Error};
 use clap::{Parser, Subcommand};
 use serde_json;
 use serde_json::Value;
 use serde::{Deserialize, Serialize};
-use flate2::read::MultiGzDecoder;   
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use zstd::stream::read::Decoder as ZstdDecoder;
-use zstd::stream::write::Encoder as ZstdEncoder;
-
 use indicatif::{ProgressBar,ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::available_parallelism;
-use threadpool::ThreadPool;
-use glob::glob; 
 use std::hash::{Hash, Hasher, DefaultHasher};
 use dashmap::DashMap;
-use rand::thread_rng;
-use rand::Rng;
-
-use rand::seq::SliceRandom;
 use rayon::prelude::*;
-use itertools::Itertools;
+use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 
 use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf, has_json_extension};
+use bincode;
 
 pub mod s3;
 pub mod io; 
@@ -85,7 +72,23 @@ enum Commands {
 
         #[arg(required=true, long)]
         output: PathBuf,
+
+        #[arg(long)]
+        save_ids_only: bool,
     },
+
+
+
+    TrueDupSeries {
+        #[arg(required=true, long)]
+        group_ids: PathBuf,
+
+        #[arg(required=true, long)]
+        polling_freq: usize,
+
+        #[arg(required=true, long)]
+        output: PathBuf,
+    }
 
 
 
@@ -190,7 +193,7 @@ fn build_config(input: &Vec<PathBuf>, output: &PathBuf) -> Result<DupConfig, Err
 =              Exact Duplicate Profile            =
 =================================================*/
 
-fn build_exact_profile(config: &PathBuf, output: &PathBuf) -> Result<(), Error> {
+fn build_exact_profile(config: &PathBuf, output: &PathBuf, save_ids_only: bool) -> Result<(), Error> {
     // Data structure here we want to save is just a vector of groups
     // where each group is a vector of (path_id, line_num) tuples
 
@@ -200,7 +203,9 @@ fn build_exact_profile(config: &PathBuf, output: &PathBuf) -> Result<(), Error> 
     let pbar = build_pbar(config.indices.len(), "Paths");
     config.indices.par_iter()
         .for_each(|(p, idx)| {
-            collect_exact_dups(p, *idx, &grouper).unwrap()
+            let result = collect_exact_dups(p, *idx, &grouper).unwrap();
+            pbar.inc(1);
+            result
         });
 
     let groups: Vec<Vec<(usize, usize)>> = grouper
@@ -209,8 +214,29 @@ fn build_exact_profile(config: &PathBuf, output: &PathBuf) -> Result<(), Error> 
         .map(|e| e.value().clone())
         .collect();
 
-    let json_groups = serde_json::to_string(&groups).unwrap().into_bytes();
-    write_mem_to_pathbuf(&json_groups, output).unwrap();
+
+    if save_ids_only {
+        // Flat list of group_ids saving some preprocessing time:
+        // i.e., groups [[doc1, doc2], [doc3], [doc4, doc5, doc6]] -> [0, 0, 1, 2, 2, 2]
+        let group_ids = AtomicUsize::new(0);
+        let group_pbar = build_pbar(groups.len(), "Groups");
+        let flat_groups: Vec<usize> = groups.par_iter()
+            .flat_map(|g| {
+                let group_id = group_ids.fetch_add(1, Ordering::SeqCst);
+                let new_vec: Vec<usize> = g.iter().map(|_| group_id).collect();
+                group_pbar.inc(1);
+                new_vec
+            }).collect();
+
+        let encoded: Vec<u8> = bincode::serialize(&flat_groups).unwrap();
+        write_mem_to_pathbuf(&encoded, output).unwrap();
+
+
+    } else {
+        // Portable (json) list of all groups, where each group is a Vec<(usize, usize)>
+        let json_groups = serde_json::to_string(&groups).unwrap().into_bytes();
+        write_mem_to_pathbuf(&json_groups, output).unwrap();
+    }
 
     Ok(())
 }
@@ -232,6 +258,73 @@ fn collect_exact_dups(path: &PathBuf, path_idx: usize, grouper: &DashMap<u64, Ve
 }
 
 
+/*=======================================================
+=                    True Dup Series                    =
+=======================================================*/
+
+fn true_dup_series(group_ids: &PathBuf, polling_freq: usize, output: &PathBuf) -> Result<(), Error> {
+    let start_main = Instant::now();
+
+    println!("Reading group contents into memory...");
+    let start_read = Instant::now();
+    let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
+    let mut group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
+    // group_contents.truncate(1000000)
+    println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
+
+    println!("Starting shuffle...");
+    let start_shuffle = Instant::now();
+    let group_contents = parallel_shuffle(group_contents);
+    println!("Shuffle completed in {:?} secs", start_shuffle.elapsed().as_secs());
+
+    // Not super threadsafe here, but that's okay
+    println!("Starting poll...");
+    let start_poll = Instant::now();
+    let uniques : DashSet<usize> = DashSet::new();
+    let total_seen = AtomicUsize::new(0);
+    let reports: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let pbar = build_pbar(group_contents.len(), "Docs");
+    group_contents.into_par_iter()
+        .for_each(|id| {
+            let count = total_seen.fetch_add(1, Ordering::SeqCst);
+            uniques.insert(id);
+            if count / polling_freq > reports.lock().unwrap().len() {
+                let mut locked_reports = reports.lock().unwrap();
+                if count / polling_freq > locked_reports.len() {
+                    locked_reports.push((count, uniques.len()));
+                }
+            }
+            pbar.inc(1);
+        });
+    println!("Added {:?} elements to poll in {:?} secs", reports.lock().unwrap().len(), start_poll.elapsed().as_secs());
+
+
+    // And then save these somewhere
+    let json_bytes = serde_json::to_vec(&reports.lock().unwrap().clone()).unwrap();
+    write_mem_to_pathbuf(&json_bytes, &output).unwrap();
+
+    println!("-----------------");
+    println!("Finishing true_dup_series in {:?} secs", start_main.elapsed().as_secs());
+    Ok(())
+}
+
+
+fn parallel_shuffle<T: Send>(v: Vec<T>) -> Vec<T> {
+    let len = v.len();
+    let v = Mutex::new(v);
+
+    (0..len).into_par_iter().for_each(|i| {
+        let mut rng = thread_rng();
+        let j = rng.gen_range(i..len);
+        if i != j {
+            let mut v = v.lock().unwrap();
+            v.swap(i, j);
+        }
+    });
+
+    v.into_inner().unwrap()
+}
+
 
 /*=================================================
 =                Main logic flow                  =
@@ -251,11 +344,15 @@ fn main() {
             result.unwrap();
             Ok(())
         },
-        Commands::ExactProfile {config, output} => {
-            build_exact_profile(&config, output)
+        Commands::ExactProfile {config, output, save_ids_only} => {
+            build_exact_profile(&config, output, *save_ids_only)
+        },
+        Commands::TrueDupSeries {group_ids, polling_freq, output} => {
+            true_dup_series(group_ids, *polling_freq, output)
         }
     };
 
+    result.unwrap();
 
 }
 
