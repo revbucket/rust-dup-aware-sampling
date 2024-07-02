@@ -1,4 +1,4 @@
-use dashmap::DashSet;
+use dashmap::{DashSet, DashMap};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::io::{BufRead};
@@ -12,7 +12,6 @@ use indicatif::{ProgressBar,ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::hash::{Hash, Hasher, DefaultHasher};
-use dashmap::DashMap;
 use rayon::prelude::*;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -78,7 +77,6 @@ enum Commands {
     },
 
 
-
     TrueDupSeries {
         #[arg(required=true, long)]
         group_ids: PathBuf,
@@ -87,6 +85,17 @@ enum Commands {
         polling_freq: usize,
 
         #[arg(required=true, long)]
+        output: PathBuf,
+    },
+
+    BuildGoodToulminProfile {
+        #[arg(required=true, long)]
+        group_ids: PathBuf,
+
+        #[arg(required=true, long)]
+        sample_freq: Vec<usize>,
+
+        #[arg(required=true, long)] 
         output: PathBuf,
     }
 
@@ -268,8 +277,7 @@ fn true_dup_series(group_ids: &PathBuf, polling_freq: usize, output: &PathBuf) -
     println!("Reading group contents into memory...");
     let start_read = Instant::now();
     let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
-    let mut group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
-    // group_contents.truncate(1000000)
+    let group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
     println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
 
     println!("Starting shuffle...");
@@ -327,6 +335,103 @@ fn parallel_shuffle<T: Send>(v: Vec<T>) -> Vec<T> {
 }
 
 
+/*===========================================================
+=                    Good-Toulmin Profiles                  =
+===========================================================*/
+#[derive(Serialize, Deserialize)]
+struct GTSeries {
+    size: usize,
+    freq: HashMap<usize, usize>
+}
+
+
+fn build_good_toulmin_profile(group_ids: &PathBuf, sample_freq: &Vec<usize>, output: &PathBuf) -> Result<(), Error> {
+    let start_main = Instant::now();
+
+    println!("Reading group contents into memory...");
+    let start_read = Instant::now();
+    let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
+    let mut group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
+    
+    println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
+
+    println!("Starting shuffle...");
+    let start_shuffle = Instant::now();
+    let mut group_contents = parallel_shuffle(group_contents);
+    println!("Shuffle completed in {:?} secs", start_shuffle.elapsed().as_secs());
+
+
+    println!("Starting GT Build...");
+    let start_gt = Instant::now();
+    let total_seen = AtomicUsize::new(0);
+    let pbar = build_pbar(group_contents.len(), "Docs");
+    let counter: DashMap<usize, usize> = DashMap::new();
+    let mut sorted_sample_freqs = sample_freq.clone();
+    sorted_sample_freqs.sort();
+    sorted_sample_freqs.reverse();
+    let max_freq = sorted_sample_freqs[0];
+    group_contents.truncate(max_freq);
+    let mut heldout_sample_freqs = sorted_sample_freqs.clone();
+    heldout_sample_freqs.reverse();
+    let sorted_sample_freqs = Arc::new(Mutex::new(sorted_sample_freqs));
+    let freq_maps: Arc<Mutex<Vec<HashMap<usize, usize>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Plan here is to:
+    // Iterate in parallel over shuffled list
+    // For each element:
+    //  - increment total_seen
+    //  - increment id in counter 
+    //  - if seen enough longer than the min sorted_sample_freqs, 
+    //      + lock and clone the counter (process into frequency maps)
+    //      + pop the last element from the sorted_sampl_freqs
+
+    group_contents.into_par_iter()
+        .for_each(|id| {
+            let count = total_seen.fetch_add(1, Ordering::SeqCst);
+            counter.entry(id).or_insert(0);
+            counter.alter(&id, |_, count| count +1);
+            let last = *sorted_sample_freqs.lock().unwrap().last().unwrap();
+            if last <= count {
+                let mut locked_freqs = sorted_sample_freqs.lock().unwrap();
+                let checkpoint = if *locked_freqs.last().unwrap() <= count {
+                    locked_freqs.pop().unwrap()
+                } else {
+                    0
+                };
+                if checkpoint > 0 {
+                    let counter_clone = counter.clone();
+                    freq_maps.lock().unwrap().push(make_freq_map(counter_clone));
+                }
+            }
+            pbar.inc(1);
+        }); 
+    println!("Build GTs in {:?} secs", start_gt.elapsed().as_secs());
+
+    // Now make the thing to write
+    let to_save: Vec<GTSeries> = heldout_sample_freqs.into_iter()
+        .zip(freq_maps.lock().unwrap().iter())
+        .map(|(size, freq)| GTSeries { size, freq: freq.clone() })
+        .collect();
+    let json_bytes = serde_json::to_vec(&to_save).unwrap();
+    write_mem_to_pathbuf(&json_bytes, &output).unwrap();
+
+
+    println!("-----------------");
+    println!("Finishing GT estimator buliding in {:?} secs", start_main.elapsed().as_secs());
+    Ok(())
+}
+
+fn make_freq_map(counter: DashMap<usize, usize>) -> HashMap<usize, usize> {
+    let mut freq_map: HashMap<usize, usize> = HashMap::new();
+    counter.iter().for_each(|entry| {
+        let value = entry.value();
+        *freq_map.entry(*value).or_insert(0) += 1;
+    });
+
+    freq_map
+}
+
+
 /*=================================================
 =                Main logic flow                  =
 =================================================*/
@@ -350,6 +455,9 @@ fn main() {
         },
         Commands::TrueDupSeries {group_ids, polling_freq, output} => {
             true_dup_series(group_ids, *polling_freq, output)
+        },
+        Commands::BuildGoodToulminProfile {group_ids, sample_freq, output} => {
+            build_good_toulmin_profile(group_ids, sample_freq, output)
         }
     };
 
