@@ -277,7 +277,13 @@ fn true_dup_series(group_ids: &PathBuf, polling_freq: usize, output: &PathBuf) -
     println!("Reading group contents into memory...");
     let start_read = Instant::now();
     let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
-    let group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
+
+    let ext = group_ids.extension().and_then(|s| s.to_str()).unwrap();
+    let group_contents: Vec<usize> = if ext == "json" {
+        serde_json::from_slice(&group_contents.into_inner().into_inner()).unwrap()
+    } else {
+        bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap()
+    };
     println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
 
     println!("Starting shuffle...");
@@ -351,7 +357,14 @@ fn build_good_toulmin_profile(group_ids: &PathBuf, sample_freq: &Vec<usize>, out
     println!("Reading group contents into memory...");
     let start_read = Instant::now();
     let group_contents = read_pathbuf_to_mem(group_ids).unwrap();
-    let mut group_contents: Vec<usize> = bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap();
+
+    let ext = group_ids.extension().and_then(|s| s.to_str()).unwrap();
+    let group_contents: Vec<usize> = if ext == "json" {
+        serde_json::from_slice(&group_contents.into_inner().into_inner()).unwrap()
+    } else {
+        bincode::deserialize(&group_contents.into_inner().into_inner()).unwrap()
+    };
+
 
     println!("Read group contents in {:?} secs", start_read.elapsed().as_secs());
 
@@ -393,7 +406,7 @@ fn build_good_toulmin_profile(group_ids: &PathBuf, sample_freq: &Vec<usize>, out
             let last = *sorted_sample_freqs.lock().unwrap().last().unwrap();
             if last <= count {
                 let mut locked_freqs = sorted_sample_freqs.lock().unwrap();
-                let checkpoint = if *locked_freqs.last().unwrap() <= count {
+                let checkpoint = if *locked_freqs.last().unwrap() <= count+1 {
                     locked_freqs.pop().unwrap()
                 } else {
                     0
