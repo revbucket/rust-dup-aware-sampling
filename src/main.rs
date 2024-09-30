@@ -292,14 +292,24 @@ fn expand_profile(input: &PathBuf, output: &PathBuf) -> Result<(), Error> {
 
     println!("Starting expansion...");
     let start_expand = Instant::now();
-    let cc_id = AtomicUsize::new(0);
-    let pbar = build_pbar(profile_contents.len(), "Keys");
+    let total_items_pred = profile_contents.iter().map(|(_, v)| v).sum::<usize>();
+    let pbar = build_pbar(total_items_pred, "CCs");
+
+    // Get a prefix sum of ids to figure out where to start counting CCs
+    let mut pfx_start = 0;
+    let pfx : HashMap<usize, usize> = profile_contents.iter().map(|(k, v)| {
+        let cur = pfx_start;
+        pfx_start += k * v;
+        (*k, cur)
+    }).collect();
+
+    // Actually expand CCs
     let expanded_ids: Vec<usize> = profile_contents.par_iter().flat_map(|(k, v)| {
         let mut subvec : Vec<usize> = Vec::new();
-        for _vi in 0..*v {
-            let cur_id = cc_id.fetch_add(1, Ordering::SeqCst);
+        let start_id = pfx.get(k).unwrap();
+        for vi in 0..*v {
             for _ki in 0..*k {
-                subvec.push(cur_id);
+                subvec.push(start_id + vi);
             }
             pbar.inc(1);
         }
@@ -307,7 +317,7 @@ fn expand_profile(input: &PathBuf, output: &PathBuf) -> Result<(), Error> {
     }).collect();
     let total_len = expanded_ids.len();
     println!("Finished expansion in {:?} secs", start_expand.elapsed().as_secs());
-    println!("Expansion is {:?}", expanded_ids);
+    //println!("Expansion is {:?}", expanded_ids);
 
 
     println!("Starting save...");
