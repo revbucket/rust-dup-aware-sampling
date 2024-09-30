@@ -76,6 +76,16 @@ enum Commands {
         save_ids_only: bool,
     },
 
+    ExpandProfile {
+        // Takes a json of {cc_size: num_ccs_with_that_size}
+        // and expands it into a list of [cc_ids] with length {k * v for k,v in input.items()}
+        #[arg(required=true, long)]
+        input: PathBuf, 
+
+        #[arg(required=true, long)]
+        output: PathBuf
+    },
+
 
     TrueDupSeries {
         #[arg(required=true, long)]
@@ -265,6 +275,54 @@ fn collect_exact_dups(path: &PathBuf, path_idx: usize, grouper: &DashMap<u64, Ve
     }
     Ok(())
 }
+
+
+/*=======================================================
+=                    Expand Profile                     =
+=======================================================*/
+fn expand_profile(input: &PathBuf, output: &PathBuf) -> Result<(), Error> {
+    let start_main = Instant::now();
+
+    println!("Expanding profile...");
+    let start_read = Instant::now();
+    let profile_contents = read_pathbuf_to_mem(input).unwrap();
+    let profile_contents : HashMap<usize, usize> = serde_json::from_slice(&profile_contents.into_inner().into_inner()).unwrap();
+    println!("Read profile in {:?} secs", start_read.elapsed().as_secs());
+
+
+    println!("Starting expansion...");
+    let start_expand = Instant::now();
+    let cc_id = AtomicUsize::new(0);
+    let pbar = build_pbar(profile_contents.len(), "Keys");
+    let expanded_ids: Vec<usize> = profile_contents.par_iter().flat_map(|(k, v)| {
+        let mut subvec : Vec<usize> = Vec::new();
+        for _vi in 0..*v {
+            let cur_id = cc_id.fetch_add(1, Ordering::SeqCst);
+            for _ki in 0..*k {
+                subvec.push(cur_id);
+            }
+            pbar.inc(1);
+        }
+        subvec
+    }).collect();
+    let total_len = expanded_ids.len();
+    println!("Finished expansion in {:?} secs", start_expand.elapsed().as_secs());
+    println!("Expansion is {:?}", expanded_ids);
+
+
+    println!("Starting save...");
+    let start_save = Instant::now();
+    let encoded: Vec<u8> = bincode::serialize(&expanded_ids).unwrap();
+    write_mem_to_pathbuf(&encoded, output).unwrap();
+    println!("Finished save in {:?} secs", start_save.elapsed().as_secs());
+
+
+    println!("-----------------");
+    println!("Finishing expansion in {:?} secs", start_main.elapsed().as_secs());
+    println!("Expanded to {:?} ids", total_len);
+    Ok(())   
+}
+
 
 
 /*=======================================================
@@ -466,6 +524,9 @@ fn main() {
         Commands::ExactProfile {config, output, save_ids_only} => {
             build_exact_profile(&config, output, *save_ids_only)
         },
+        Commands::ExpandProfile {input, output} => {
+            expand_profile(input, output)
+        }
         Commands::TrueDupSeries {group_ids, polling_freq, output} => {
             true_dup_series(group_ids, *polling_freq, output)
         },
